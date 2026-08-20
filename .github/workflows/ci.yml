@@ -1,0 +1,21 @@
+# No GPU on github-hosted runners, so this can't run the numerics — that
+# still happens locally (each file's __main__ checks against torch). What CI
+# does catch: syntax breakage, stray merge-conflict markers, and files that
+# fail to compile after a refactor. Cheap insurance, runs on every push.
+
+name: ci
+on: [push, pull_request]
+
+jobs:
+  compile-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: byte-compile every file
+        run: python -m py_compile *.py
+      - name: no leftover conflict markers
+        run: |
+          ! grep -rn '^<<<<<<< \|^>>>>>>> \|^=======$' --include='*.py' --include='*.md' --include='*.cu' .
