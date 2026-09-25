@@ -9,8 +9,9 @@ and backprop through". The glue that makes it a real op:
   the backward rebuilds P from, so it's saved on the ctx instead of recomputed
 - backward returns grads in the input dtype — autograd requires backward
   outputs to match forward input dtypes
-- constraints (N_CTX a multiple of the block sizes, no masking) are asserted
-  once here rather than exploding inside a kernel
+- used to assert seqlen was a multiple of both block sizes, because 03's and
+  21's kernels had no masking back then; both handle arbitrary seqlen now, so
+  the assert is gone and the tests cover odd lengths
 
 Verified end-to-end against SDPA's autograd, then timed: this whole thing
 (one forward kernel + two backward kernels) vs SDPA's fused fwd+bwd.
@@ -37,12 +38,12 @@ import triton  # noqa: E402  (after _load so import order reads top-down)
 
 
 def _forward(q, k, v, sm_scale):
-    """08's kernel, but keeping the logsumexp the backward needs. Same launch
-    as k03.attention — that one allocates M and throws it away."""
+    """file 03's kernel, but keeping the logsumexp the backward needs. Same launch
+    and config as k03.attention — that one allocates M and throws it away."""
     Z, H, N_CTX, HEAD_DIM = q.shape
     o = torch.empty_like(q)
     M = torch.empty((Z, H, N_CTX), device=q.device, dtype=torch.float32)
-    BLOCK_M, BLOCK_N = 128, 64
+    BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 8, 3   # swept, see file 03
     grid = (triton.cdiv(N_CTX, BLOCK_M), Z * H, 1)
     k03._attn_fwd[grid](
         q, k, v, sm_scale, M, o,
@@ -52,7 +53,7 @@ def _forward(q, k, v, sm_scale):
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         Z, H, N_CTX,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
-        num_warps=8, num_stages=3,
+        num_warps=num_warps, num_stages=num_stages,
     )
     return o, M
 
@@ -61,9 +62,6 @@ class FlashAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, sm_scale):
-        N_CTX = q.shape[2]
-        assert N_CTX % 128 == 0 and N_CTX % 64 == 0, \
-            "26's backward assumes block-aligned seq len; pad before calling"
         o, lse = _forward(q, k, v, sm_scale)
         ctx.save_for_backward(q, k, v, o, lse)
         ctx.sm_scale = sm_scale
@@ -118,6 +116,19 @@ if __name__ == "__main__":
         print(f"{name} max error vs SDPA autograd = {err:.2e}")
         torch.testing.assert_close(mine, ref, atol=2e-2, rtol=0)
     print("✅ flash attention autograd integration passed")
+
+    # odd seqlen end-to-end: impossible before 03/21 learned to mask.
+    # detach before cloning — q3 already requires grad, so a bare clone is a
+    # non-leaf and never accumulates .grad; the ref side would silently be None
+    q3, k3, v3 = (t.clone().requires_grad_(True) for t in (
+        torch.randn(1, 2, 1000, 64, dtype=dtype, device="cuda") for _ in range(3)))
+    do3 = torch.randn_like(q3)
+    flash_attention(q3, k3, v3, sm_scale).backward(do3)
+    q4, k4, v4 = (t.detach().clone().requires_grad_(True) for t in (q3, k3, v3))
+    torch.nn.functional.scaled_dot_product_attention(q4, k4, v4, scale=sm_scale).backward(do3)
+    for mine, ref in ((q3.grad, q4.grad), (k3.grad, k4.grad), (v3.grad, v4.grad)):
+        torch.testing.assert_close(mine, ref, atol=2e-2, rtol=0)
+    print("✅ odd seqlen 1000 autograd passed")
     # note: no double-backward — the backward launches opaque kernels, so
     # grad-of-grad would silently be zeros rather than an error. same caveat
     # as every production flash-attn extension
