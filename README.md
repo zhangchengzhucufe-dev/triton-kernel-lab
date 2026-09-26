@@ -2,7 +2,7 @@
 
 Practice code worked through alongside the official tutorials; files from 06 onward are my own additions.
 Environment: WSL2 + triton 3.8.0. Each file runs directly with `python xx.py` (GPU required) and automatically checks numerics against torch.
-File 29 builds a CUDA extension on first run (needs `pip install ninja` and nvcc on PATH). CI is compile-only since github runners have no GPU — the numerics checks are the `__main__` blocks.
+File 29 builds a CUDA extension on first run (needs `pip install ninja` and nvcc on PATH). CI is compile-only since github runners have no GPU — the real gate is `python check_all.py`, which runs every file's self-check (27/27 in ~2.5 min on my machine).
 
 ## What's written so far
 
@@ -28,6 +28,7 @@ File 29 builds a CUDA extension on first run (needs `pip install ninja` and nvcc
 - 27 stream-K GEMM: flattens all (tile, k-iter) work into one list and deals equal chunks to each SM, so the tail wave doesn't strand most of the GPU idle; partial tiles go to a workspace and a small fixup kernel reduces them (deterministic, no atomics). ~6 TFLOPS vs cuBLAS's 20 at 2048³ — dynamic-bound K loops block pipelining, noted in the docstring
 - 28 int8 GEMM (W8A8): per-row/per-col symmetric scales, int8 tensor-core dot with exact int32 accumulate, scales folded in at the end. 1.8x over fp16 on the same shape (36.6 vs 20.3), ~1.2% of output dynamic range lost
 - 29 rmsnorm in CUDA C++ (cuda/rmsnorm.cu, warp shuffle + shared mem reduction): the "without the DSL" version. My float4-vectorized loads turned out no faster than scalar half loads — coalesced is coalesced; numbers in the file
+- 30 flash attention as a train-able op: 08's forward + 26's backward inside one autograd.Function, the forward's logsumexp handed straight to the backward. Gradients match SDPA's autograd to ~1e-3; fwd+bwd lands at ~0.8x SDPA's fused path (its backward is far more tuned than mine)
 - benchmark.py: one harness for the headline kernels, measures achievable peaks (copy + read probes, min-of-N timing) and plots the roofline + speedup charts. Outputs perf-results.csv / roofline.png / speedup.png
 - PROFILING.md: per-kernel roofline analysis — arithmetic intensities worked out by hand, % of measured peak, and what Nsight Compute would tell me next (it doesn't run under WSL2)
 
