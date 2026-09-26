@@ -24,6 +24,8 @@ Environment: WSL2 + triton 3.8.0. Each file runs directly with `python xx.py` (G
 - 24 paged attention decode: K/V live in fixed-size pages with a per-sequence block table, virtual-memory style (the vLLM layout); walks the table page by page with online softmax, GQA included. Pairs with 21 — that one split the KV dim across SMs, this one fixes the cache layout
 - 25 grouped GEMM for MoE: all experts in one launch. Tokens are pre-sorted by expert so each expert owns a contiguous slice; programs for experts that ran out of tokens exit early
 - 26 flash attention backward: both kernels rebuild P from the logsumexp the forward saved; dK/dV and dQ run as two kernels because sharing one would need atomics on dQ. The rowsum(P∘dP) term collapses to rowsum(dO∘O), precomputed in one torch line
+- 27 stream-K GEMM: flattens all (tile, k-iter) work into one list and deals equal chunks to each SM, so the tail wave doesn't strand most of the GPU idle; partial tiles go to a workspace and a small fixup kernel reduces them (deterministic, no atomics). ~6 TFLOPS vs cuBLAS's 20 at 2048³ — dynamic-bound K loops block pipelining, noted in the docstring
+- 28 int8 GEMM (W8A8): per-row/per-col symmetric scales, int8 tensor-core dot with exact int32 accumulate, scales folded in at the end. 1.8x over fp16 on the same shape (36.6 vs 20.3), ~1.2% of output dynamic range lost
 
 ## Pitfalls hit along the way (all kept in code comments)
 
@@ -35,8 +37,9 @@ Environment: WSL2 + triton 3.8.0. Each file runs directly with `python xx.py` (G
 6. File 21 took me the longest: first, q and KV have different plane strides (q is D, KV is N*D) and can't share; second, masked-out k rows produce qk=0 rather than -inf, polluting the softmax denominator; third, the merge formula must not multiply acc by l. Three bugs stacked together gave errors on the order of 1e1
 7. I misremembered the silu derivative: dsilu = sig*(1 + x*(1-sig)); the sigmoid derivative is sig*(1-sig), not sig*sig
 8. File 24: in the wrapper I set PAGE_SIZE from the block table's width instead of the cache's — two sizes that both look like "pages", and the kernel happily read 32-token "pages" out of 16-token blocks, garbage everywhere. Every size a kernel takes should be traced back to the exact tensor dimension it describes
+9. File 27: the B block's start offset is k_off*BK*k_row_stride, and I dropped the stride — no crash, 98% of tiles numerically fine, only the tiles cut at chunk boundaries were garbage. Partially-correct output is way more dangerous than a crash; the only defense was the host-side work decomposition doubling as a test oracle
 
 ## Not yet written
 
-The stream-K variant of split-K — will add when there's time.
+fp8 and TMA-heavy stuff needs a Hopper card, so those wait for hardware. Next up when there's time: folding the activation quantization pass into the previous layer (file 28's honest caveat).
 make_block_ptr is deprecated in 3.8; the new way is tl.make_tensor_descriptor, with an example in file 11.
