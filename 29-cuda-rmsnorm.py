@@ -19,8 +19,15 @@ First build takes a minute or two; torch caches it in cuda/build after that.
 
 import importlib.util
 import os
+import sys
 
 import torch
+
+# torch's ninja check shells out to `ninja`, which only resolves if the
+# venv's bin dir is on PATH — running this file with an absolute interpreter
+# path skips that. put it back before cpp_extension notices
+os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
+
 from torch.utils.cpp_extension import load
 
 HERE = os.path.dirname(os.path.abspath(__file__))

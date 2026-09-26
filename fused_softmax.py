@@ -141,25 +141,45 @@ def benchmark(M, N, provider):
     return gbps(ms)
 
 
-benchmark.run(show_plots=False, print_data=True, save_path='.')
+# triton's own TestBenchmark.run imports pandas unconditionally — without it,
+# fall back to timing one shape by hand so the file still completes
+try:
+    benchmark.run(show_plots=False, print_data=True, save_path='.')
+except ImportError:
+    import time
+    x = torch.randn(4096, 4096, device=DEVICE, dtype=torch.float32)
+    for name, fn in (("torch", lambda: torch.softmax(x, -1)),
+                     ("triton", lambda: softmax(x)),
+                     ("naive", lambda: naive_softmax(x))):
+        fn(); torch.cuda.synchronize()
+        t = time.perf_counter()
+        for _ in range(50):
+            fn()
+        torch.cuda.synchronize()
+        ms = (time.perf_counter() - t) / 50 * 1e3
+        print(f"{name:8s} {2 * x.numel() * 4 / (ms * 1e-3) / 1e9:7.0f} GB/s")
 
 # triton 3.8 saves the plot without a title (upstream commented out ax.set_title),
 # so redraw from the CSV and overwrite the figure with a titled version.
-import matplotlib
+# plotting deps are optional — the correctness check above is the part that matters
+try:
+    import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import pandas as pd
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
 
-df = pd.read_csv("softmax-performance.csv")
-plt.figure(figsize=(10, 6))
-plt.plot(df["N"], df["Triton (GB/s)"], "o-", color="tab:blue", label="Triton")
-plt.plot(df["N"], df["Torch (GB/s)"], "s-", color="tab:green", label="Torch")
-plt.plot(df["N"], df["Naive Softmax (GB/s)"], "^-", color="tab:red", label="Naive Softmax")
-plt.xlabel("N")
-plt.ylabel("GB/s")
-plt.title(f"Softmax throughput, M=4096, {torch.cuda.get_device_name()}")
-plt.grid(alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.savefig("softmax-performance.png", dpi=150)
+    df = pd.read_csv("softmax-performance.csv")
+    plt.figure(figsize=(10, 6))
+    plt.plot(df["N"], df["Triton (GB/s)"], "o-", color="tab:blue", label="Triton")
+    plt.plot(df["N"], df["Torch (GB/s)"], "s-", color="tab:green", label="Torch")
+    plt.plot(df["N"], df["Naive Softmax (GB/s)"], "^-", color="tab:red", label="Naive Softmax")
+    plt.xlabel("N")
+    plt.ylabel("GB/s")
+    plt.title(f"Softmax throughput, M=4096, {torch.cuda.get_device_name()}")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("softmax-performance.png", dpi=150)
+except ImportError:
+    print("matplotlib/pandas not installed, skipping the replot")

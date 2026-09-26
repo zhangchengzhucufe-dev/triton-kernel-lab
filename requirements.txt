@@ -1,0 +1,12 @@
+# the kernels themselves
+torch>=2.4
+triton>=3.0
+
+# benchmark.py charts
+matplotlib
+
+# file 29's cuda extension build
+ninja
+
+# only used by fused_softmax's replot step, safe to skip
+pandas

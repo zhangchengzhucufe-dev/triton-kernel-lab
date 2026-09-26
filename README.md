@@ -6,7 +6,7 @@ File 29 builds a CUDA extension on first run (needs `pip install ninja` and nvcc
 
 ## What's written so far
 
-- vector_add / fused_softmax / replicate.py — the first ones typed along with tutorials 01/02; benchmark results for the softmax one are in softmax-performance.png
+- vector_add / fused_softmax — the first ones typed along with tutorials 01/02; benchmark results for the softmax one are in softmax-performance.png (replicate.py was tutorial 03's exercise, dropped later)
 - 06 matmul: tiling + tl.dot, with autotune and L2 swizzle. Reaches about half of cuBLAS performance at 4096³
 - 07 layernorm: first hand-written backward; dW/dB accumulated with atomic_add
 - 08 flash attention: forward only. Core is online softmax — each K block scanned requires rescaling the old acc by exp(m_old-m_new)
