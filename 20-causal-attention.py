@@ -1,14 +1,19 @@
-"""causal 版 flash attention（08 号的非 causal 改 causal，08 先看）。
+"""Causal flash attention (causal variant of ex. 08; read 08 first).
 
-mask 不用 tl.where 全程盖，把 K 循环拆两段：对角线左边的整块合法直接
-算，对角块才逐元素 mask，右边的循环区间是空的，一个 FLOP 不花。
+Instead of masking everything with tl.where, split the K loop in two: the
+block-column range left of the diagonal is fully valid and computed directly;
+only the diagonal block needs elementwise masking. The range right of the
+diagonal is empty, so no FLOPs are spent there.
 
-mask 填 -1e6 别填 -inf：qk 还没减 m_ij，-inf - (-inf) 会出 NaN。
+Fill the mask with -1e6, not -inf: qk hasn't been reduced by m_ij yet, and
+-inf - (-inf) produces NaN.
 
-最大的坑写在 _attn_inner 的 return 那里：tl.advance 推进的是局部变量，
-拆成两段循环后第二段拿到的是原始指针，等于把前面的列重复算了一遍。
-误差只有 0.1 左右，一开始当精度问题查了半天。jit 函数里的指针要么
-随返回值传出去，要么干脆别拆段。
+The biggest pitfall is noted at _attn_inner's return: tl.advance advances
+a local variable, so after splitting into two loops, the second loop gets
+the original pointers — re-computing the earlier columns. The error is only
+about 0.1, and I initially chased it as a precision issue for a long time.
+Inside a jit function, pointers must either be returned to the caller or
+you simply shouldn't split the loop.
 """
 
 import torch
@@ -23,16 +28,16 @@ def _attn_inner(acc, l_i, m_i, q, K_ptr, V_ptr,
                 APPLY_CAUSAL: tl.constexpr):
     for start_n in tl.range(lo, hi, BLOCK_N):
         k = tl.load(K_ptr)
-        qk = tl.dot(q, k)     # (BLOCK_M, BLOCK_N) fp32 累加
+        qk = tl.dot(q, k)     # (BLOCK_M, BLOCK_N) fp32 accumulator
         if APPLY_CAUSAL:
-            # 全局行号 vs 全局列号：行 >= 列 才可见
+            # global row index vs global col index: visible only when row >= col
             rows = q_block_start + tl.arange(0, BLOCK_M)
             cols = start_n + tl.arange(0, BLOCK_N)
             qk = tl.where(rows[:, None] >= cols[None, :], qk, -1.0e6)
 
         m_new = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
         p = tl.math.exp2(qk * qk_scale - m_new[:, None])
-        alpha = tl.math.exp2(m_i - m_new)          # 在线 softmax 的重缩放
+        alpha = tl.math.exp2(m_i - m_new)          # online softmax rescaling
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None]
         v = tl.load(V_ptr)
@@ -40,8 +45,9 @@ def _attn_inner(acc, l_i, m_i, q, K_ptr, V_ptr,
         m_i = m_new
         K_ptr = tl.advance(K_ptr, (0, BLOCK_N))
         V_ptr = tl.advance(V_ptr, (BLOCK_N, 0))
-    # 坑：K_ptr/V_ptr 是本函数的局部变量，必须把推进后的指针返回给调用者，
-    # 否则下一段循环会从原始偏移重新开始，把已算过的列重复算一遍！
+    # Pitfall: K_ptr/V_ptr are local variables of this function; the advanced
+    # pointers must be returned to the caller, otherwise the next loop segment
+    # restarts from the original offsets and re-computes the already-done columns!
     return acc, l_i, m_i, K_ptr, V_ptr
 
 
@@ -54,7 +60,7 @@ def _causal_attn_fwd(
 ):
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
-    # 本例让 Q/K/V 布局完全一致：(Z, H, N_CTX, D)，共享 (z,h) 偏移
+    # Q/K/V layouts are identical in this example: (Z, H, N_CTX, D), sharing the (z,h) offset
     base = off_hz.to(tl.int64) * stride_zh
 
     q_ptr = tl.make_block_ptr(base=Q + base, shape=(N_CTX, HEAD_DIM), strides=(stride_m, stride_d),
@@ -70,14 +76,14 @@ def _causal_attn_fwd(
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
-    qk_scale = sm_scale * 1.44269504    # exp → exp2 换底
+    qk_scale = sm_scale * 1.44269504    # exp → exp2 base conversion
 
     q_block_start = start_m * BLOCK_M
-    # 段 1：列区间 [0, q_block_start)，全部在对角线左侧 → 无 mask
+    # Segment 1: column range [0, q_block_start), fully left of the diagonal → no mask
     acc, l_i, m_i, k_ptr, v_ptr = _attn_inner(acc, l_i, m_i, q, k_ptr, v_ptr, qk_scale,
                                               0, q_block_start, q_block_start,
                                               BLOCK_M, HEAD_DIM, BLOCK_N, APPLY_CAUSAL=False)
-    # 段 2：对角块 [q_block_start, q_block_start + BLOCK_M) → 逐元素 mask
+    # Segment 2: diagonal block [q_block_start, q_block_start + BLOCK_M) → elementwise mask
     acc, l_i, m_i, k_ptr, v_ptr = _attn_inner(acc, l_i, m_i, q, k_ptr, v_ptr, qk_scale,
                                               q_block_start, q_block_start + BLOCK_M, q_block_start,
                                               BLOCK_M, HEAD_DIM, BLOCK_N, APPLY_CAUSAL=True)
@@ -93,7 +99,7 @@ def causal_attention(q, k, v, sm_scale):
     grid = (triton.cdiv(N_CTX, BLOCK_M), Z * H)
     _causal_attn_fwd[grid](
         q, k, v, sm_scale, o,
-        q.stride(1), q.stride(2), q.stride(3),   # (z,h) 维、行维、列维
+        q.stride(1), q.stride(2), q.stride(3),   # (z,h) dim, row dim, col dim
         Z, H, N_CTX,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D,
         num_warps=8, num_stages=3,
@@ -120,8 +126,8 @@ if __name__ == "__main__":
     sm_scale = D ** -0.5
 
     o = causal_attention(q, k, v, sm_scale)
-    # SDPA 的 is_causal 参考实现
+    # Reference implementation: SDPA with is_causal
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-    print(f"最大误差 = {(o.float() - ref.float()).abs().max().item():.2e}")
+    print(f"max error = {(o.float() - ref.float()).abs().max().item():.2e}")
     torch.testing.assert_close(o.float(), ref.float(), atol=2e-2, rtol=0)
-    print("✅ causal flash attention 正确性通过")
+    print("✅ causal flash attention correctness passed")

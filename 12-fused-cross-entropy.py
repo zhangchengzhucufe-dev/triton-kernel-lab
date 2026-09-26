@@ -1,9 +1,9 @@
-"""融合交叉熵，流式 logsumexp，前向反向都不物化 (N, V) 中间矩阵。
+"""Fused cross entropy with streaming logsumexp; neither forward nor backward materializes the (N, V) intermediate.
 
-loss = logsumexp(logits) - logits[target]，logsumexp 可以像 flash
-attention 的 online softmax 一样分块流式算。eager 写法要先存一份
-log_softmax 的 fp32 中间张量，vocab 大的时候 HBM 流量很夸张，
-这里 8192x32K 快了 3 倍多。反向就是 softmax - onehot。
+loss = logsumexp(logits) - logits[target]; logsumexp can be computed in
+streaming chunks like flash attention's online softmax. The eager version
+has to store an fp32 log_softmax intermediate — huge HBM traffic at large
+vocab sizes (3x+ faster here at 8192x32K). The backward is just softmax - onehot.
 """
 
 import torch
@@ -22,7 +22,7 @@ def cross_entropy_fwd_kernel(
     logits_ptr += row * stride_lm
     target = tl.load(targets_ptr + row)
 
-    # --- 第一遍：流式 logsumexp（和 flash attention 的在线 softmax 同构）---
+    # --- Pass 1: streaming logsumexp (isomorphic to flash attention's online softmax) ---
     m = -float("inf")
     l = 0.0
     for off in tl.range(0, N_COLS, BLOCK_SIZE):
@@ -34,7 +34,7 @@ def cross_entropy_fwd_kernel(
         m = m_new
     lse = m + tl.log(l)
 
-    # --- 第二遍：取目标 logit，loss = logsumexp - x[target] ---
+    # --- Pass 2: fetch the target logit, loss = logsumexp - x[target] ---
     target_logit = tl.load(logits_ptr + target).to(tl.float32)
     tl.store(loss_ptr + row, lse - target_logit)
 
@@ -51,7 +51,7 @@ def cross_entropy_bwd_kernel(
     logits_ptr += row * stride_lm
     grad_logits_ptr += row * stride_gm
     target = tl.load(targets_ptr + row)
-    dloss = tl.load(grad_loss_ptr + row)      # 上游梯度（标量），可做 loss 缩放
+    dloss = tl.load(grad_loss_ptr + row)      # upstream gradient (scalar), can act as loss scaling
 
     m = -float("inf")
     l = 0.0
@@ -109,14 +109,14 @@ def bench(fn, iters=20):
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    N, V = 8192, 32768          # batch 8192 × vocab 32K，模拟真实 LM 头
+    N, V = 8192, 32768          # batch 8192 x vocab 32K, simulating a real LM head
     logits = (torch.randn((N, V), device='cuda', dtype=torch.float32) * 3).requires_grad_(True)
     targets = torch.randint(0, V, (N,), device='cuda')
 
-    # ---- 正确性 ----
+    # ---- correctness ----
     loss = fused_ce(logits, targets)
     ref = torch.nn.functional.cross_entropy(logits, targets, reduction='none')
-    print(f"loss 最大误差 = {(loss - ref).abs().max().item():.2e}")
+    print(f"loss max error = {(loss - ref).abs().max().item():.2e}")
     torch.testing.assert_close(loss, ref, atol=1e-3, rtol=1e-3)
 
     grad_wrt_logits = torch.randn_like(ref) * 1e-2
@@ -125,11 +125,11 @@ if __name__ == "__main__":
     ref_grad = logits.grad.clone()
     logits.grad = None
     loss.backward(grad_wrt_logits)
-    print(f"grad 最大误差 = {(logits.grad.float() - ref_grad).abs().max().item():.2e}")
+    print(f"grad max error = {(logits.grad.float() - ref_grad).abs().max().item():.2e}")
     torch.testing.assert_close(logits.grad.float(), ref_grad, atol=1e-3, rtol=1e-2)
-    print("✅ fused cross entropy 正反传播正确")
+    print("✅ fused cross entropy fwd/bwd OK")
 
-    # ---- 性能：融合版 vs torch eager（log_softmax 物化中间张量）----
+    # ---- performance: fused vs torch eager (log_softmax materializes the intermediate) ----
     logits2 = logits.detach().clone().requires_grad_(True)
     def eager():
         l = torch.nn.functional.cross_entropy(logits2, targets)
@@ -139,4 +139,4 @@ if __name__ == "__main__":
         l.sum().backward()
     t_eager = bench(eager)
     t_fused = bench(fused)
-    print(f"eager {t_eager:.1f} ms   fused {t_fused:.1f} ms   加速比 {t_eager/t_fused:.1f}x")
+    print(f"eager {t_eager:.1f} ms   fused {t_fused:.1f} ms   speedup {t_eager/t_fused:.1f}x")

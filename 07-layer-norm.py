@@ -1,8 +1,9 @@
-"""LayerNorm 前向 + 反向，对应 tutorial 05，第一次手写 backward。
+"""LayerNorm forward + backward, corresponding to tutorial 05; my first hand-written backward.
 
-注意 E[x²] - E[x]² 这个算方差的写法有灾难性抵消的风险，x 量级太大时
-要换 Welford。反向里 dXhat = dY * w 这步我第一版漏了乘 w，结果全错。
-累加一律 fp32，哪怕输入是 fp16。
+Note that the E[x²] - E[x]² formulation for variance risks catastrophic cancellation;
+switch to Welford when x is too large. In the backward, I omitted the * w in
+dXhat = dY * w in my first version, which made everything wrong.
+Accumulate in fp32 throughout, even for fp16 inputs.
 """
 
 import torch
@@ -24,8 +25,9 @@ def _layer_norm_fwd_kernel(
     x = tl.load(X + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
 
     mean = tl.sum(x, axis=0) / N
-    # E[x²] - E[x]²：数值上不如 Welford 稳，但配合 fp32 累加在教育场景足够。
-    # 若 x 量级 >1e4，应改用 Welford 或两遍法（先中心化再算平方和）。
+    # E[x²] - E[x]²: numerically less stable than Welford, but fine for teaching
+    # purposes with fp32 accumulation. If |x| > 1e4, switch to Welford or a
+    # two-pass method (center first, then sum of squares).
     _var = tl.sum(x * x, axis=0) / N - mean * mean
     rstd = 1 / tl.sqrt(_var + eps)
 
@@ -45,9 +47,9 @@ def _layer_norm_bwd_kernel(
         M, N,
         BLOCK_SIZE: tl.constexpr,
 ):
-    # 每个 program 负责一行的 dX，同时原子累加自己的那部分 DW/DB。
-    # 教程做法是让每个 program 只处理若干行的分片再 reduce，这里为了
-    # 可读性用最直白的"一行一个 program"版本。
+    # Each program handles one row's dX while atomically accumulating its share of DW/DB.
+    # The tutorial has each program process a shard of rows then reduce; here we use
+    # the most straightforward "one program per row" version for readability.
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
@@ -62,11 +64,11 @@ def _layer_norm_bwd_kernel(
     xhat = tl.where(mask, xhat, 0.0)
     dy = tl.where(mask, dy, 0.0)
 
-    # dW 的定义是 sum_i dy_i * xhat_i（按行求和），用 fp32 原子加写回
+    # dW is defined as sum_i dy_i * xhat_i (summed over rows); write back with fp32 atomic adds
     tl.atomic_add(DW + cols, dy * xhat, mask=mask)
     tl.atomic_add(DB + cols, dy, mask=mask)
 
-    # y = xhat * w + b 关于 xhat 的上游梯度是 dy * w
+    # The upstream gradient of y = xhat * w + b w.r.t. xhat is dy * w
     dxhat = dy * w
     c1 = tl.sum(xhat * dxhat, axis=0) / N
     c2 = tl.sum(dxhat, axis=0) / N
@@ -124,16 +126,16 @@ if __name__ == "__main__":
 
     y_triton = layer_norm(x, weight, bias, 1e-5)
     y_ref = torch.nn.functional.layer_norm(x, (N,), weight, bias, 1e-5)
-    print(f"前向最大误差 = {(y_triton - y_ref).abs().max().item():.2e}")
+    print(f"forward max error = {(y_triton - y_ref).abs().max().item():.2e}")
     torch.testing.assert_close(y_triton, y_ref, atol=1e-2, rtol=0)
 
-    # 反向对照
+    # Backward check
     grad = torch.randn_like(x)
     y_ref.backward(grad)
     x_ref_grad, w_ref_grad, b_ref_grad = x.grad.clone(), weight.grad.clone(), bias.grad.clone()
     x.grad = None; weight.grad = None; bias.grad = None
     y_triton.backward(grad)
-    print(f"dX 最大误差 = {(x.grad - x_ref_grad).abs().max().item():.2e}")
-    print(f"dW 最大误差 = {(weight.grad - w_ref_grad).abs().max().item():.2e}")
-    print(f"dB 最大误差 = {(bias.grad - b_ref_grad).abs().max().item():.2e}")
-    print("✅ layernorm 正反传播正确性通过")
+    print(f"dX max error = {(x.grad - x_ref_grad).abs().max().item():.2e}")
+    print(f"dW max error = {(weight.grad - w_ref_grad).abs().max().item():.2e}")
+    print(f"dB max error = {(bias.grad - b_ref_grad).abs().max().item():.2e}")
+    print("✅ layernorm forward/backward correctness passed")

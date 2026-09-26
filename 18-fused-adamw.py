@@ -1,8 +1,10 @@
-"""fused AdamW。eager 的优化器一步要起十几个小 kernel，参数量大的时候
-光 p/m/v/g 的读写就是几十 GB 的 HBM 流量，纯带宽瓶颈，融合收益最大。
+"""Fused AdamW. The eager optimizer launches a dozen tiny kernels per step; with
+large parameter counts, just the p/m/v/g reads and writes are tens of GB of HBM
+traffic — pure bandwidth-bound, so fusion pays off the most.
 
-注意权重衰减是解耦的（直接从 p 扣，不进 m/v），偏置修正的 1-β^t 是
-标量，在 host 算好传进来，没必要每个 program 算一遍。
+Note weight decay is decoupled (subtracted straight from p, never into m/v), and
+the 1-β^t bias-correction factors are scalars computed on the host and passed in —
+no need to recompute them in every program.
 """
 
 import torch
@@ -29,12 +31,12 @@ def _adamw_kernel(
     m = beta1 * m + (1.0 - beta1) * g
     v = beta2 * v + (1.0 - beta2) * g * g
 
-    # 偏置修正在 host 端算好传进来（1-β^t 是标量，没必要 4096 个 program 各算一遍）
+    # Bias correction computed on the host and passed in (1-β^t is a scalar; no need for 4096 programs to each compute it)
     m_hat = m / bias_correction1
     v_hat = v / bias_correction2
     update = m_hat / (tl.sqrt(v_hat) + eps)
 
-    # 解耦权重衰减：直接从 p 里扣，不进 m/v，也不进梯度
+    # Decoupled weight decay: subtract straight from p, never into m/v or the gradient
     p_new = p - lr * (update + weight_decay * p)
 
     tl.store(P + offsets, p_new, mask=mask)
@@ -63,12 +65,12 @@ if __name__ == "__main__":
     m = torch.zeros_like(p)
     v = torch.zeros_like(p)
 
-    # Triton 版
+    # Triton version
     p_t, m_t, v_t = p.clone(), m.clone(), v.clone()
     for step in range(1, 6):
         adamw_step(p_t, g, m_t, v_t, step)
 
-    # PyTorch AdamW 参考（同样的 weight_decay 语义）
+    # PyTorch AdamW reference (same weight_decay semantics)
     ref = torch.optim.AdamW([torch.nn.Parameter(p.clone())], lr=1e-3, betas=(0.9, 0.999),
                             eps=1e-8, weight_decay=0.01)
     p_ref = ref.param_groups[0]['params'][0]
@@ -77,11 +79,11 @@ if __name__ == "__main__":
         ref.step()
 
     err = (p_t - p_ref).abs().max().item()
-    print(f"5 步 AdamW 后与 torch.optim.AdamW 的最大偏差 = {err:.2e}")
+    print(f"max deviation from torch.optim.AdamW after 5 AdamW steps = {err:.2e}")
     assert err < 1e-5
-    print("✅ fused AdamW 正确性通过")
+    print("✅ fused AdamW correctness passed")
 
-    # 带宽视角：每步读 p/m/v/g 各 4B，写 p/m/v 各 4B，共 28B/元素
+    # Bandwidth view: each step reads p/m/v/g at 4B each and writes p/m/v at 4B each — 28B per element
     import time
     def bench(fn, iters=20):
         for _ in range(3): fn()
@@ -92,5 +94,5 @@ if __name__ == "__main__":
         e.record(); torch.cuda.synchronize()
         return s.elapsed_time(e) / iters
     t = bench(lambda: adamw_step(p_t, g, m_t, v_t, 5))
-    print(f"每步 {t:.2f} ms → 单 kernel 消化 {n * 28 / (t * 1e-3) / 1e9:.0f} GB/s 的 HBM 流量"
-          f"（融合前这些流量要分摊到十几个 kernel）")
+    print(f"{t:.2f} ms per step → single kernel sustaining {n * 28 / (t * 1e-3) / 1e9:.0f} GB/s of HBM traffic"
+          f" (pre-fusion, that traffic was spread across a dozen kernels)")

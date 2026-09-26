@@ -1,7 +1,8 @@
-"""RoPE，NeoX/HF 的半分约定：第 (i, i+d/2) 两列乘 2D 旋转。
+"""RoPE with the NeoX/HF half-split convention: columns (i, i+d/2) are rotated in 2D.
 
-cos/sin 直接在 kernel 里从 base 现算（写 exp2 形式快一些），没有做
-cache 表。原地写回，decode 时每步都要过一遍，省一半显存流量。
+cos/sin are computed on the fly from base inside the kernel (exp2 form is a bit
+faster), no cache table. In-place write-back: decode touches it every step, so
+this saves half the memory traffic.
 """
 
 import torch
@@ -20,8 +21,8 @@ def _rope_kernel(
     pos = tl.load(positions + seq)
 
     half = HEAD_DIM // 2
-    # θ_i = base^(-2i/d)。写成 exp2 形式：2^(-2i/d · log2(base))，硬件更快。
-    # 注意 arange 的参数必须是 constexpr，直接写 HEAD_DIM // 2（不能经由运行期变量）
+    # theta_i = base^(-2i/d). In exp2 form: 2^(-2i/d * log2(base)), faster on hardware.
+    # Note: arange args must be constexpr, so write HEAD_DIM // 2 directly (not via a runtime var)
     inv_freq = tl.exp2(tl.arange(0, HEAD_DIM // 2).to(tl.float32) * (-2.0 * tl.log2(ROTARY_BASE) / HEAD_DIM))
     angles = pos * inv_freq
     cos = tl.cos(angles)
@@ -42,7 +43,7 @@ def _rope_kernel(
 
 
 def apply_rope_inplace(q, positions, rotary_base=10000.0):
-    """q: (seq, heads, head_dim)，原地施加 RoPE。"""
+    """q: (seq, heads, head_dim); applies RoPE in place."""
     seq, heads, head_dim = q.shape
     assert head_dim % 2 == 0
     _rope_kernel[(seq,)](
@@ -54,7 +55,7 @@ def apply_rope_inplace(q, positions, rotary_base=10000.0):
 
 
 def rope_reference(x, positions, base=10000.0):
-    """HF 风格参考实现，用于对照。"""
+    """HF-style reference implementation for comparison."""
     d = x.shape[-1]
     inv_freq = 1.0 / (base ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d))
     angles = positions.float()[:, None] * inv_freq[None, :]          # (seq, d/2)
@@ -73,6 +74,6 @@ if __name__ == "__main__":
 
     ref = rope_reference(q, positions)
     apply_rope_inplace(q, positions)
-    print(f"最大误差 = {(q.float() - ref.float()).abs().max().item():.2e}")
+    print(f"max error = {(q.float() - ref.float()).abs().max().item():.2e}")
     torch.testing.assert_close(q.float(), ref.float(), atol=1e-2, rtol=0)
-    print("✅ RoPE 正确性通过")
+    print("✅ RoPE correctness passed")

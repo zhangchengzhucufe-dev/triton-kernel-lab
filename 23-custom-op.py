@@ -1,17 +1,20 @@
-"""把 Triton kernel 注册成 torch 自定义算子，接进 torch.compile。
+"""Register a Triton kernel as a torch custom op and wire it into torch.compile.
 
-光会写 kernel 不够，工程上要能塞进 PyTorch 的体系里，不然 autograd /
-torch.compile / export 都不带玩。标准姿势是 torch.library.custom_op：
+Writing a kernel isn't enough; in practice it needs to plug into PyTorch's
+ecosystem, otherwise autograd / torch.compile / export won't cooperate. The
+standard approach is torch.library.custom_op:
 
-- custom_op 注册前向，需要带 schema 注明哪些参数是 Tensor；
-- register_fake 提供元信息（只描述 shape/dtype，不真算），
-  torch.compile 靠它做 trace，不真起 kernel；
-- autograd 接 ConnectTheDots？不用，直接包一层 autograd.Function 再
-  注册成 custom_op 有点绕，这里演示"前向 custom op + 手动 backward"
-  最常见的接法：custom_op 的本体不管梯度，梯度走外面那个 Function。
+- custom_op registers the forward and needs a schema noting which params are Tensors;
+- register_fake provides metadata (describes shape/dtype only, no real compute);
+  torch.compile relies on it for tracing and never launches the kernel;
+- Connect autograd to it? No — wrapping in autograd.Function and registering
+  that as a custom op is convoluted. This demo shows the most common wiring:
+  "forward as a custom op + manual backward": the custom op itself knows
+  nothing about gradients; gradients flow through the outer Function.
 
-踩坑：custom_op 的函数参数名不能叫 'x_' 之类带下划线结尾的，
-schema 解析会挂；Tensor 返回必须新建，不能原地改输入（会静默出错）。
+Pitfall: custom_op function parameter names can't end with an underscore
+like 'x_' — schema parsing breaks; returned Tensors must be freshly allocated,
+never mutated in place (that fails silently).
 """
 
 import torch
@@ -35,7 +38,7 @@ def _silu_impl(x: torch.Tensor) -> torch.Tensor:
     return y
 
 
-# 注册成 "myext::silu"。mutates_args=[] 表示不原地改输入
+# Registered as "myext::silu". mutates_args=[] means inputs aren't mutated in place
 @torch.library.custom_op("myext::silu", mutates_args=())
 def triton_silu(x: torch.Tensor) -> torch.Tensor:
     return _silu_impl(x.contiguous())
@@ -43,7 +46,7 @@ def triton_silu(x: torch.Tensor) -> torch.Tensor:
 
 @triton_silu.register_fake
 def _(x):
-    # compile 做静态 trace 时调用：只要 shape/dtype 对就行，不跑 kernel
+    # Called during compile's static tracing: only shape/dtype must be right, no kernel launch
     return torch.empty_like(x)
 
 
@@ -56,7 +59,7 @@ class SiluAutograd(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy):
         # dsilu/dx = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-        # 注意别背成 sigmoid(x)*(1+x*sigmoid(x))，sigmoid 的导数是 sig*(1-sig)
+        # Don't misremember it as sigmoid(x)*(1+x*sigmoid(x)); sigmoid's derivative is sig*(1-sig)
         (x,) = ctx.saved_tensors
         xf = x.float()
         sig = torch.sigmoid(xf)
@@ -71,25 +74,26 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     x = torch.randn(1 << 20, device='cuda', dtype=torch.float16, requires_grad=True)
 
-    # 1. 直接调用
+    # 1. Direct call
     y = triton_silu(x.detach())
     y_ref = torch.nn.functional.silu(x.detach())
     torch.testing.assert_close(y, y_ref, atol=1e-2, rtol=0)
-    print("✅ custom op 前向正确")
+    print("✅ custom op forward correct")
 
-    # 2. autograd（注意对照的 x2 要复制同一份数据，否则梯度过的是不同输入）
+    # 2. autograd (the reference x2 must be a copy of the same data, otherwise
+    # the gradient flows through a different input)
     x.grad = None
     silu_with_grad(x).sum().backward()
     x2 = x.detach().clone().requires_grad_(True)
     torch.nn.functional.silu(x2).sum().backward()
     torch.testing.assert_close(x.grad.float(), x2.grad.float(), atol=1e-2, rtol=1e-2)
-    print("✅ autograd 正确")
+    print("✅ autograd correct")
 
-    # 3. 塞进 torch.compile（验证 register_fake 起作用）
+    # 3. Plug into torch.compile (verifies register_fake works)
     @torch.compile
     def compiled(a):
         return triton_silu(a) * 2
 
     out = compiled(x.detach())
     torch.testing.assert_close(out, y_ref * 2, atol=1e-2, rtol=0)
-    print("✅ torch.compile trace 通过")
+    print("✅ torch.compile trace passed")

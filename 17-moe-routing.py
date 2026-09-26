@@ -1,8 +1,9 @@
-"""MoE routing：softmax → top-k → 重归一化 → 专家计数。
+"""MoE routing: softmax → top-k → renormalize → expert counts.
 
-k 一般只有 2~8，不用 tl.sort，迭代 k 次 argmax + 屏蔽就行。
-屏蔽要用 -inf 不能置 0，否则会重复选同一个专家。
-counts 用 atomic 累，是负载均衡 / load-balancing loss 的数据来源。
+k is usually only 2~8; no need for tl.sort, just iterate argmax + masking k times.
+Masking must use -inf, not 0, otherwise the same expert gets picked repeatedly.
+counts are accumulated atomically and feed load-balancing metrics / the
+load-balancing loss.
 """
 
 import torch
@@ -22,11 +23,11 @@ def _moe_route_kernel(
     mask = offs_e < N_EXPERTS
     logits = tl.load(logits_ptr + token * stride_lm + offs_e, mask=mask,
                      other=-float("inf")).to(tl.float32)
-    # 手写 softmax（部分版本的 tl.softmax 接口不一致，手写 3 行最稳）
+    # Hand-rolled softmax (tl.softmax's interface varies across versions; 3 lines is most reliable)
     probs = tl.exp(logits - tl.max(logits, axis=0))
     probs = probs / tl.sum(probs, axis=0)
 
-    # 迭代 top-k：argmax → 记录 → 用 -inf 屏蔽。k 很小时这是最优写法。
+    # Iterative top-k: argmax → record → mask with -inf. Optimal when k is small.
     sum_topk = 0.0
     for k in tl.static_range(TOP_K):
         idx = tl.argmax(probs, axis=0)
@@ -36,7 +37,7 @@ def _moe_route_kernel(
         sum_topk += w
         probs = tl.where(offs_e == idx, -float("inf"), probs)
 
-    # Mixtral 风格：top-k 权重重归一化
+    # Mixtral-style: renormalize the top-k weights
     for k in tl.static_range(TOP_K):
         w = tl.load(weights_ptr + token * TOP_K + k)
         tl.store(weights_ptr + token * TOP_K + k, w / sum_topk)
@@ -64,7 +65,7 @@ if __name__ == "__main__":
     logits = torch.randn((tokens, n_experts), device='cuda', dtype=torch.float32)
     weights, indices, counts = moe_route(logits, top_k)
 
-    # PyTorch 参考
+    # PyTorch reference
     probs = torch.softmax(logits, dim=-1)
     ref_w, ref_idx = torch.topk(probs, top_k, dim=-1)
     ref_w = ref_w / ref_w.sum(-1, keepdim=True)
@@ -73,6 +74,6 @@ if __name__ == "__main__":
     torch.testing.assert_close(indices, ref_idx.to(torch.int32), atol=0, rtol=0)
     torch.testing.assert_close(weights, ref_w, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(counts.to(torch.int64), ref_counts, atol=0, rtol=0)
-    print("✅ MoE 路由正确性通过")
-    print(f"负载示例（{n_experts} 个专家收到的 token 数，均值 {tokens * top_k / n_experts:.0f}）：")
+    print("✅ MoE routing correctness passed")
+    print(f"load sample ({n_experts} experts, tokens received each, mean {tokens * top_k / n_experts:.0f}):")
     print(counts[:16].tolist(), "...")

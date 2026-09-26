@@ -1,8 +1,8 @@
-"""分块 matmul，对应官方 tutorial 03。
+"""Tiled matmul, corresponding to official tutorial 03.
 
-tl.dot 会走 Tensor Core，这是 triton 能逼近 cuBLAS 的原因。
-GROUP_M 那段 swizzle 是为了 L2 命中率，不加的话慢不少。
-K 方向越界用 % 折叠而不是 mask，省谓词寄存器。
+tl.dot goes through the Tensor Cores, which is why triton can approach cuBLAS.
+The GROUP_M swizzle is for L2 hit rate; without it, it's noticeably slower.
+K-dimension out-of-bounds is folded with % instead of masked, saving predicate registers.
 """
 
 import torch
@@ -11,7 +11,7 @@ import triton.language as tl
 
 
 def naive_matmul(A, B):
-    """PyTorch 参考实现（实际会调 cuBLAS，我们只用它做正确性对照）。"""
+    """PyTorch reference implementation (actually calls cuBLAS; used only for correctness checks)."""
     return A @ B
 
 
@@ -39,8 +39,9 @@ def matmul_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    # --- L2 swizzle: 把一维 pid 重映射成二维 tile 坐标，让同一 GROUP_SIZE_M
-    #     行的 tile 被相邻的 program 处理，从而共享 A 的 L2 缓存驻留 ---
+    # --- L2 swizzle: remap the 1D pid to 2D tile coordinates so that tiles in
+    #     the same GROUP_SIZE_M row are processed by adjacent programs, sharing
+    #     A's L2 cache residency ---
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -56,8 +57,10 @@ def matmul_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # % K 让最后一个不满 block 的越界部分绕回有效数据，配合 % M / % N 的
-        # 越界"折叠"，避免读非法地址（比 mask 更省，因为 mask 需要额外谓词寄存器）
+        # % K makes the out-of-bounds part of the last partial block wrap around to
+        # valid data; combined with the % M / % N "folding" of out-of-bounds rows/cols,
+        # this avoids reading illegal addresses (cheaper than a mask, which needs
+        # extra predicate registers)
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         accumulator = tl.dot(a, b, accumulator)
@@ -73,9 +76,9 @@ def matmul_kernel(
 
 
 def matmul(A, B):
-    # autotune 的装饰对象必须是 @triton.jit 的 kernel 本身；
-    # key=['M','N','K'] 表示形状变了才重新调优
-    assert A.shape[1] == B.shape[0], "不满足矩阵乘法形状要求"
+    # autotune must decorate the @triton.jit kernel itself;
+    # key=['M','N','K'] means re-tuning only happens when the shape changes
+    assert A.shape[1] == B.shape[0], "matmul shape requirement not met"
     assert A.is_contiguous() and B.is_contiguous()
     M, K = A.shape
     _, N = B.shape
@@ -98,6 +101,6 @@ if __name__ == "__main__":
 
     triton_output = matmul(A, B)
     torch_output = torch.matmul(A, B)
-    print(f"最大绝对误差 = {(torch_output - triton_output).abs().max().item():.2e}")
+    print(f"max abs error = {(torch_output - triton_output).abs().max().item():.2e}")
     assert torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0)
-    print("✅ matmul 正确性通过")
+    print("✅ matmul correctness passed")

@@ -1,8 +1,8 @@
-"""silu(g) * u，swiglu 的激活部分，LLaMA 系 FFN 用的。
+"""silu(g) * u, the activation part of swiglu, used in LLaMA-style FFNs.
 
-内容不复杂，主要是练逐元素激活的手写反向：
-ds/dg = sigmoid(g) * (1 + g * (1 - sigmoid(g)))，推对这一个，
-其他激活函数的反向都是一个套路。
+Nothing complicated here — mainly practice hand-writing the backward for an
+elementwise activation: ds/dg = sigmoid(g) * (1 + g * (1 - sigmoid(g))).
+Get this one right and every other activation's backward follows the same recipe.
 """
 
 import torch
@@ -69,7 +69,7 @@ if __name__ == "__main__":
     y = silu_mul(g, u)
     y_ref = torch.nn.functional.silu(g) * u
     torch.testing.assert_close(y, y_ref, atol=1e-2, rtol=0)
-    print(f"前向最大误差 = {(y - y_ref).abs().max().item():.2e}")
+    print(f"fwd max error = {(y - y_ref).abs().max().item():.2e}")
 
     dy = torch.randn_like(y)
     y_ref.backward(dy)
@@ -78,5 +78,5 @@ if __name__ == "__main__":
     y.backward(dy)
     torch.testing.assert_close(g.grad.float(), g_ref.float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(u.grad.float(), u_ref.float(), atol=1e-2, rtol=1e-2)
-    print(f"反向最大误差 = {(g.grad.float() - g_ref.float()).abs().max().item():.2e}")
-    print("✅ silu_mul 正反传播正确")
+    print(f"bwd max error = {(g.grad.float() - g_ref.float()).abs().max().item():.2e}")
+    print("✅ silu_mul fwd/bwd OK")

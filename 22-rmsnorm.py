@@ -1,10 +1,11 @@
-"""RMSNorm，LLaMA/Qwen 用的那种（比 07 的 LayerNorm 少减均值、少个 bias）。
+"""RMSNorm, the kind used by LLaMA/Qwen (LayerNorm from ex. 07 minus the
+mean subtraction and the bias).
 
 y = x / rms(x) * w,  rms = sqrt(mean(x²) + eps)
 
-反向我推的：r = 1/sqrt(mean(x²)+eps)，dr/dx_j = -r³·x_j/N，
-所以 dx = r·(dy·w) - r³·x·sum(dy·w·x)/N。和 torch 的 nn.RMSNorm
-(2.4+) 对了数值。
+Backward derived by hand: r = 1/sqrt(mean(x²)+eps), dr/dx_j = -r³·x_j/N,
+so dx = r·(dy·w) - r³·x·sum(dy·w·x)/N. Numerically verified against
+torch's nn.RMSNorm (2.4+).
 """
 
 import torch
@@ -79,7 +80,7 @@ if __name__ == "__main__":
 
     y = rmsnorm(x, w)
     ref = torch.nn.functional.rms_norm(x, (N,), w)
-    print(f"前向最大误差 = {(y - ref).abs().max().item():.2e}")
+    print(f"forward max error = {(y - ref).abs().max().item():.2e}")
     torch.testing.assert_close(y, ref, atol=1e-2, rtol=0)
 
     dy = torch.randn_like(y)
@@ -87,7 +88,7 @@ if __name__ == "__main__":
     gx, gw = x.grad.clone(), w.grad.clone()
     x.grad = w.grad = None
     y.backward(dy)
-    print(f"dX 最大误差 = {(x.grad.float() - gx.float()).abs().max().item():.2e}")
-    print(f"dW 最大误差 = {(w.grad.float() - gw.float()).abs().max().item():.2e}")
+    print(f"dX max error = {(x.grad.float() - gx.float()).abs().max().item():.2e}")
+    print(f"dW max error = {(w.grad.float() - gw.float()).abs().max().item():.2e}")
     torch.testing.assert_close(x.grad.float(), gx.float(), atol=1e-2, rtol=1e-2)
-    print("✅ rmsnorm 正反传播正确")
+    print("✅ rmsnorm forward and backward passed")

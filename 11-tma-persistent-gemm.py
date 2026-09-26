@@ -1,8 +1,9 @@
-"""TMA + persistent 的现代版 matmul（对应 tutorial 09 的简化版）。
+"""Modern matmul with TMA + persistent scheduling (a simplified take on tutorial 09).
 
-TMA 把"搬一个 tile"变成一条硬件指令，地址计算和越界 padding 都不归
-线程管了。注意要 triton.set_allocator 注册一个分配回调，TMA 描述符
-要一小块工作区。persistent 调度见 09 号。
+TMA turns "move a tile" into a single hardware instruction — no more manual
+address computation or out-of-bounds padding. Note you must register an
+allocation callback via triton.set_allocator; TMA descriptors need a small
+scratch buffer. See 09 for persistent scheduling details.
 """
 
 import torch
@@ -12,7 +13,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 def _alloc(size: int, alignment: int, stream):
-    # TMA 描述符需要一小块 host 分配的工作区，Triton 通过这个回调要内存
+    # TMA descriptors need a small host-allocated scratch buffer; Triton requests memory via this callback
     return torch.empty(size, device="cuda", dtype=torch.int8)
 
 
@@ -31,7 +32,7 @@ def tma_matmul_kernel(
     total_tiles = num_tiles_m * num_tiles_n
 
     for tile_id in tl.range(tl.program_id(0), total_tiles, NUM_SMS, flatten=True):
-        # 列优先遍历 tile（同一列的 tile 共享同一个 A 条带，L2 命中率更好）
+        # Column-major tile traversal (tiles in the same column share an A strip, better L2 hit rate)
         pid_n = tile_id % num_tiles_n
         pid_m = tile_id // num_tiles_n
         off_m = pid_m * BLOCK_M
@@ -39,7 +40,7 @@ def tma_matmul_kernel(
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for off_k in tl.range(0, K, BLOCK_K):
-            a = a_desc.load([off_m, off_k])       # TMA 硬件拷贝，无手工指针
+            a = a_desc.load([off_m, off_k])       # TMA hardware copy, no manual pointers
             b = b_desc.load([off_k, off_n])
             acc = tl.dot(a, b, acc)
 
@@ -85,9 +86,9 @@ if __name__ == "__main__":
 
     C = tma_matmul(A, B)
     ref = A @ B
-    print(f"最大绝对误差 = {(C - ref).abs().max().item():.2e}")
+    print(f"max abs error = {(C - ref).abs().max().item():.2e}")
     torch.testing.assert_close(C, ref, atol=1e-1, rtol=1e-2)
-    print("✅ TMA persistent matmul 正确性通过")
+    print("✅ TMA persistent matmul correctness OK")
 
     t_tma = bench(lambda: tma_matmul(A, B))
     t_cublas = bench(lambda: A @ B)

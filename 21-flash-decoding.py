@@ -1,14 +1,15 @@
-"""flash-decoding：decode 阶段（q 长度=1）的注意力，KV cache 很长时用。
+"""Flash-decoding: attention for the decode phase (q length = 1), for long KV caches.
 
-问题：q 只有一行，如果按 seq 维切 grid，program 数只有 batch*heads，
-SM 大片空转。解法和 19 号 split-K 一个思想：把 KV 的 seq 维切开，
-每个 program 算一段的部分结果，再用第二个 kernel 归并。
+Problem: q has only one row, so if the grid is split along the seq dim, there are
+only batch*heads programs and most SMs sit idle. Same idea as ex. 19's split-K:
+split KV's seq dim, each program computes a partial result for one chunk, then
+a second kernel merges them.
 
-归并的数学还是 online softmax 那一套：每段带出 (acc, m, l) 三元组，
-合并时 m 取 max，acc 和 l 都按 exp(m_i - m_max) 缩放后相加。
-vLLM / FlashInfer 的 paged attention 就是这套再叠一个 block table。
+The merge math is just online softmax again: each chunk yields an (acc, m, l)
+triple; on merge, m takes the max, and acc and l are both scaled by exp(m_i - m_max)
+and summed. vLLM / FlashInfer's paged attention is this scheme plus a block table.
 
-中间结果 (SPLITS, Z*H, D) 很小，放 HBM 无所谓。
+The intermediate result (SPLITS, Z*H, D) is tiny, so keeping it in HBM is fine.
 """
 
 import torch
@@ -26,13 +27,13 @@ def _decode_split_kernel(
 ):
     split = tl.program_id(0)
     off_hz = tl.program_id(1)
-    # 坑：q 的平面只有 D 这么大，K/V 的平面是 N*D，两个 stride 不能混用
-    # （我第一版就用错了，误差直接 1e1 量级）
+    # Pitfall: q's plane is only D elements, K/V's plane is N*D; the two strides
+    # must not be mixed up (I got this wrong in my first version, errors hit ~1e1)
     q_base = off_hz.to(tl.int64) * HEAD_DIM
     base = off_hz.to(tl.int64) * stride_kv_plane
 
     offs_d = tl.arange(0, HEAD_DIM)
-    q = tl.load(Q + q_base + offs_d * stride_d).to(tl.float32)   # 只有 1 行 q
+    q = tl.load(Q + q_base + offs_d * stride_d).to(tl.float32)   # only 1 row of q
 
     lo = split * CHUNK_SIZE
     hi = tl.minimum(lo + CHUNK_SIZE, SEQ_LEN)
@@ -46,10 +47,11 @@ def _decode_split_kernel(
         mask = offs_n < hi
         k = tl.load(K + base + offs_n[:, None] * stride_seq + offs_d[None, :] * stride_d,
                     mask=mask[:, None], other=0.0)
-        # (BLOCK_N,) 的分数：单 q 行就是一次矩阵-向量乘
+        # (BLOCK_N,) scores: a single q row makes this a matrix-vector product
         qk = tl.sum(k.to(tl.float32) * q[None, :], axis=1) * sm_scale
-        # mask 掉的行 k 全是 0，qk 算出来是 0 而不是 -inf，
-        # 不屏蔽的话这些假行会以 exp(-m_new) 的权重污染分母 l
+        # Masked rows have k all zeros, so qk comes out 0 instead of -inf;
+        # without masking, these fake rows would pollute the denominator l
+        # with weight exp(-m_new)
         qk = tl.where(mask, qk, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(qk))
         alpha = tl.math.exp2((m_i - m_new) * 1.44269504)
@@ -60,8 +62,9 @@ def _decode_split_kernel(
         l_i = l_i * alpha + tl.sum(p)
         m_i = m_new
 
-    # 三元组落盘，等第二个 kernel 归并。空分片（lo >= SEQ_LEN）也要写，
-    # 否则归并时读到垃圾 —— 我第一版就漏了这个
+    # Write the triple out for the second kernel to merge. Empty splits
+    # (lo >= SEQ_LEN) must be written too, otherwise the merge reads garbage
+    # — I missed this in my first version
     out_of_range = lo >= SEQ_LEN
     m_safe = tl.where(out_of_range, float("-inf"), m_i)
     tl.store(ACC + split.to(tl.int64) * tl.num_programs(1) * HEAD_DIM + off_hz * HEAD_DIM + offs_d,
@@ -86,7 +89,8 @@ def _decode_combine_kernel(
     m_max = tl.max(m, axis=0)
 
     # out = Σ_i acc_i·exp(m_i-m_max) / Σ_i l_i·exp(m_i-m_max)
-    # （我第一版把 acc 也乘了 l，等于权重多乘了一次，结果直接错）
+    # (My first version multiplied acc by l as well, applying the weight twice;
+    # the result was simply wrong)
     e = tl.exp(m - m_max)
     e = tl.where(mask, e, 0.0)
     denom = tl.sum(e * l, axis=0)
@@ -99,7 +103,7 @@ def _decode_combine_kernel(
 
 
 def flash_decode(q, k, v, sm_scale, num_splits=8, block_n=128):
-    """q: (Z, H, 1, D)  k/v: (Z, H, N, D)，返回 (Z, H, 1, D)"""
+    """q: (Z, H, 1, D)  k/v: (Z, H, N, D), returns (Z, H, 1, D)"""
     Z, H, _, D = q.shape
     N = k.shape[2]
     q2 = q.reshape(Z * H, D).contiguous()
@@ -135,16 +139,16 @@ def bench(fn, iters=50):
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    Z, H, N, D = 4, 32, 32768, 128     # 32K 上下文的 KV cache
+    Z, H, N, D = 4, 32, 32768, 128     # 32K-context KV cache
     q = torch.randn((Z, H, 1, D), device='cuda', dtype=torch.float16) * 0.5
     k = torch.randn((Z, H, N, D), device='cuda', dtype=torch.float16) * 0.5
     v = torch.randn((Z, H, N, D), device='cuda', dtype=torch.float16) * 0.5
 
     o = flash_decode(q, k, v, D ** -0.5)
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    print(f"最大误差 = {(o.float() - ref.float()).abs().max().item():.2e}")
+    print(f"max error = {(o.float() - ref.float()).abs().max().item():.2e}")
     torch.testing.assert_close(o.float(), ref.float(), atol=2e-2, rtol=0)
-    print("✅ flash-decoding 正确性通过")
+    print("✅ flash-decoding correctness passed")
 
     t_split = bench(lambda: flash_decode(q, k, v, D ** -0.5))
     t_sdpa = bench(lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v))

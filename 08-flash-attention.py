@@ -1,9 +1,10 @@
-"""Flash Attention v2 前向（tutorial 06 的精简版，无 dropout / causal / fp8）。
+"""Flash Attention v2 forward (a slimmed-down version of tutorial 06, no dropout / causal / fp8).
 
-核心是 online softmax：分块扫 K，每块都会更新 running max，旧的
-acc 和 l 都得按 exp(m_old - m_new) 重缩放一遍，最后统一除 l。
-中间的 S 和 P 矩阵全程不落 HBM，这就是它省显存的原因。
-qk_scale 里乘的 1.44269504 是把 exp 换成 exp2（硬件指令更快）的换底系数。
+The core is online softmax: scan K in blocks, each block updates the running max, and
+both the old acc and l must be rescaled by exp(m_old - m_new), divided by l at the end.
+The intermediate S and P matrices never touch HBM — that's what saves memory.
+The 1.44269504 multiplied into qk_scale is the log2(e) base-change factor that swaps
+exp for exp2 (a faster hardware instruction).
 """
 
 import torch
@@ -20,25 +21,26 @@ def _attn_fwd_inner(
         STAGE: tl.constexpr,
         offs_m, offs_n, N_CTX,
 ):
-    # STAGE 决定本 program 处理 causal 矩阵的哪一段（本简化版不做 causal，
-    # 但保留 tutorial 的 stage 结构，方便对照原版阅读）
+    # STAGE decides which segment of the causal matrix this program handles (this
+    # simplified version doesn't do causal, but keeps tutorial's stage structure
+    # for easier comparison with the original)
     lo, hi = 0, N_CTX
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         k = tl.load(K_block_ptr)
-        qk = tl.dot(q, k)  # (BLOCK_M, BLOCK_N)，fp32 累加
+        qk = tl.dot(q, k)  # (BLOCK_M, BLOCK_N), fp32 accumulation
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-        qk = qk * qk_scale - m_ij[:, None]          # 平移到 <= 0，防溢出
-        p = tl.math.exp2(qk)                        # 用 exp2：硬件指令更快
-        alpha = tl.math.exp2(m_i - m_ij)            # 在线 softmax 的重缩放因子
+        qk = qk * qk_scale - m_ij[:, None]          # shift to <= 0 to avoid overflow
+        p = tl.math.exp2(qk)                        # exp2: faster hardware instruction
+        alpha = tl.math.exp2(m_i - m_ij)            # online softmax rescaling factor
         l_ij = tl.sum(p, 1)
-        acc = acc * alpha[:, None]                  # 修正之前的 PV 部分和
+        acc = acc * alpha[:, None]                  # correct the previous PV partial sum
         v = tl.load(V_block_ptr)
         p = p.to(tl.float16)
-        acc = tl.dot(p, v, acc)                     # 累加 P @ V
+        acc = tl.dot(p, v, acc)                     # accumulate P @ V
         l_i = l_i * alpha + l_ij
         m_i = m_ij
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
@@ -57,21 +59,22 @@ def _attn_fwd(
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
-    start_m = tl.program_id(0)          # Q 的第几个 block
-    off_hz = tl.program_id(1)           # (batch * num_heads) 合并成一维
+    start_m = tl.program_id(0)          # which block of Q
+    off_hz = tl.program_id(1)           # (batch * num_heads) flattened to 1D
     off_z = off_hz // H
     off_h = off_hz % H
     qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
 
-    # 注意：kernel 内不能定义 Python lambda/闭包，块指针必须显式构造。
-    # K 用 (HEAD_DIM, N_CTX) 的转置视图，使 tl.dot(q, k) 直接成立。
+    # Note: Python lambdas/closures can't be defined inside kernels; block pointers
+    # must be constructed explicitly. K uses a transposed (HEAD_DIM, N_CTX) view so
+    # tl.dot(q, k) works directly.
     Q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qk),
         offsets=(start_m * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
         base=K + qvk_offset, shape=(HEAD_DIM, N_CTX), strides=(stride_kk, stride_kn),
-        offsets=(0, 0), block_shape=(HEAD_DIM, BLOCK_N), order=(0, 1),   # K 转置视图
+        offsets=(0, 0), block_shape=(HEAD_DIM, BLOCK_N), order=(0, 1),   # K transposed view
     )
     V_block_ptr = tl.make_block_ptr(
         base=V + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_vn, stride_vk),
@@ -88,14 +91,14 @@ def _attn_fwd(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    qk_scale = sm_scale * 1.44269504    # 把 exp 换成 exp2 的换底系数
+    qk_scale = sm_scale * 1.44269504    # log2(e) base-change factor to swap exp for exp2
     q = tl.load(Q_block_ptr)
     acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
                                     start_m, qk_scale, BLOCK_M, HEAD_DIM, BLOCK_N, 4,
                                     offs_m, offs_n, N_CTX)
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.dtype.element_ty))
-    # 存 logsumexp 供反向使用（本文件只做前向，保留该惯例）
+    # Store logsumexp for the backward pass (this file only does forward; kept as a convention)
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i + tl.math.log2(l_i))
 
@@ -133,6 +136,6 @@ if __name__ == "__main__":
 
     o_triton = attention(q, k, v, sm_scale)
     o_ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale)
-    print(f"最大误差 = {(o_triton - o_ref).abs().max().item():.2e}")
+    print(f"max error = {(o_triton - o_ref).abs().max().item():.2e}")
     torch.testing.assert_close(o_triton, o_ref, atol=2e-2, rtol=0)
-    print("✅ flash attention 前向正确性通过")
+    print("✅ flash attention forward correctness passed")

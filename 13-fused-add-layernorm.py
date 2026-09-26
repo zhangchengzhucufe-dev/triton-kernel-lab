@@ -1,7 +1,8 @@
-"""add + layernorm 融合，transformer 每层跑两次的那种（参考 apex 的 FusedLayerNorm）。
+"""Fused add + layernorm, the one transformers run twice per layer (after apex's FusedLayerNorm).
 
-比 07 号多了两个输入和一个 residual_out 输出（残差流要落盘给下一层用），
-融合收益随输入个数涨，实测比 eager 快 1.5 倍。
+One more input and a residual_out output compared to 07 (the residual stream
+must be written back for the next layer). Fusion gains grow with the number
+of inputs — measured ~1.5x faster than eager.
 """
 
 import torch
@@ -24,7 +25,7 @@ def _add_layernorm_kernel(
     res = tl.load(RES + row * stride_res + cols, mask=mask, other=0.0).to(tl.float32)
     z = x + res
 
-    # residual_out 原样落盘（保持输入 dtype），下一个 block 还要用它
+    # Store residual_out as-is (keeping the input dtype); the next block needs it
     tl.store(RES_OUT + row * stride_res_out + cols, z.to(RES_OUT.dtype.element_ty), mask=mask)
 
     mean = tl.sum(z, axis=0) / N
@@ -63,7 +64,7 @@ if __name__ == "__main__":
     y_ref = torch.nn.functional.layer_norm(z_ref, (N,), w, b, 1e-5)
     torch.testing.assert_close(res_out, z_ref)
     torch.testing.assert_close(y, y_ref, atol=1e-2, rtol=0)
-    print("✅ fused add+layernorm 正确性通过")
+    print("✅ fused add+layernorm correctness OK")
 
     def bench(fn, iters=100):
         for _ in range(10): fn()
@@ -80,4 +81,4 @@ if __name__ == "__main__":
         torch.nn.functional.layer_norm(z, (N,), w, b, 1e-5)
         return z
     t_eager = bench(eager)
-    print(f"eager {t_eager:.1f} us   fused {t_fused:.1f} us   加速比 {t_eager/t_fused:.1f}x")
+    print(f"eager {t_eager:.1f} us   fused {t_fused:.1f} us   speedup {t_eager/t_fused:.1f}x")
