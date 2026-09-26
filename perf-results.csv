@@ -1,0 +1,7 @@
+case,ours,baseline,our_ms,baseline_ms,speedup,our_throughput,baseline_throughput,arith_intensity_flop_per_byte,pct_of_peak
+gemm 4096^3,06 matmul,cuBLAS,6.960,5.679,0.82,19.7 TFLOP/s,24.2 TFLOP/s,1365.3,72%
+attn fwd 4k ctx,08 flash attn,SDPA,22.387,21.624,0.97,24.6 TFLOP/s,25.4 TFLOP/s,2048.0,89%
+decode 32k cache,21 flash-decoding,SDPA,7.237,13.034,1.80,296.8 GB/s,164.8 GB/s,1.0,92%
+transpose 8192^2,09 transpose,torch .T.contiguous(),0.943,2.754,2.92,284.6 GB/s,97.5 GB/s,0.0,89%
+histogram 8 bins,10 privatized,10 naive atomics,0.060,1.014,16.94,280.4 GB/s,16.6 GB/s,0.0,87%
+int8 gemm 2048^3,28 int8 W8A8,cuBLAS fp16,0.454,1.016,2.24,37.8 TFLOP/s,16.9 TFLOP/s,1024.0,137%
